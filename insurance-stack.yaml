@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation template for an S3 upload task on ECS Fargate from CodeBuild.
+
+Parameters:
+  RunId:
+    Type: String
+    Default: sample-run
+    Description: Example task run identifier; override RUN_ID when starting the build.
+  S3ObjectKey:
+    Type: String
+    Default: sample/output.txt
+    Description: S3 object key written by the Fargate task.
+
+Resources:
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: insurance-fargate-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VpcInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: insurance-fargate-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow outbound access for the Fargate task.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: insurance-fargate
+
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/insurance-fargate
+      RetentionInDays: 14
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteOutputObject
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${OutputBucket.Arn}/*
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: insurance-worker
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: insurance-worker
+          Image: public.ecr.aws/aws-cli/aws-cli:2
+          Essential: true
+          Command:
+            - s3
+            - cp
+            - /etc/hostname
+            - s3://placeholder/placeholder
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartFargateTask
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/insurance-worker:*
+                  - !GetAtt Cluster.Arn
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: insurance-start-fargate
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        EnvironmentVariables:
+          - Name: ECS_CLUSTER
+            Value: !Ref Cluster
+          - Name: TASK_DEFINITION
+            Value: !Ref TaskDefinition
+          - Name: SUBNET_ID
+            Value: !Ref PublicSubnet
+          - Name: SECURITY_GROUP_ID
+            Value: !Ref FargateSecurityGroup
+          - Name: S3_BUCKET
+            Value: !Ref OutputBucket
+          - Name: S3_OBJECT_KEY
+            Value: !Ref S3ObjectKey
+          - Name: RUN_ID
+            Value: !Ref RunId
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  overrides=$(jq -n \
+                    --arg bucket "$S3_BUCKET" \
+                    --arg key "$S3_OBJECT_KEY" \
+                    --arg run_id "$RUN_ID" \
+                    '{
+                      containerOverrides: [{
+                        name: "insurance-worker",
+                        command: ["s3", "cp", "/etc/hostname", ("s3://" + $bucket + "/" + $key)],
+                        environment: [
+                          {name: "S3_BUCKET", value: $bucket},
+                          {name: "S3_OBJECT_KEY", value: $key},
+                          {name: "RUN_ID", value: $run_id}
+                        ]
+                      }]
+                    }')
+                  response=$(aws ecs run-task \
+                    --cluster "$ECS_CLUSTER" \
+                    --task-definition "$TASK_DEFINITION" \
+                    --launch-type FARGATE \
+                    --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
+                    --overrides "$overrides" \
+                    --started-by "$RUN_ID")
+                  if printf '%s' "$response" | jq -e '(.failures // []) | length > 0' >/dev/null; then
+                    printf '%s\n' "$response" | jq -r '.failures[] | "Fargate launch failed: \(.reason) \(.detail // "")"'
+                    exit 1
+                  fi
+                  task_arn=$(printf '%s' "$response" | jq -r '.tasks[0].taskArn // empty')
+                  if [ -z "$task_arn" ]; then
+                    printf '%s\n' "ECS did not return a task ARN: $response" >&2
+                    exit 1
+                  fi
+                  printf 'Started Fargate task: %s\n' "$task_arn"
+
+Outputs:
+  OutputBucketName:
+    Description: S3 bucket receiving the Fargate task output.
+    Value: !Ref OutputBucket
+  CodeBuildProjectName:
+    Description: CodeBuild project that starts the Fargate task.
+    Value: !Ref CodeBuildProject
+  ECSClusterName:
+    Description: ECS cluster for the Fargate task.
+    Value: !Ref Cluster
+  TaskDefinitionArn:
+    Description: Fargate task definition.
+    Value: !Ref TaskDefinition
