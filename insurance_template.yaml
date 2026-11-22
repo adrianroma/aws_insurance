@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Build a Spring Boot Hello World container and run it as an ECS Fargate task.
+
+Parameters:
+  HelloName:
+    Type: String
+    Default: World
+    Description: Name used by the Spring Boot application when it prints its greeting.
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Container image tag created by the CodeBuild build.
+
+Resources:
+  ImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep the most recent 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": {"type": "expire"}
+            }]
+          }
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VpcInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow outbound connections for the Fargate task.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: springboot-hello-world
+
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/springboot-hello-world
+      RetentionInDays: 14
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildImageAndRunFargateTask
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt ImageRepository.Arn
+              - Effect: Allow
+                Action: ecs:RegisterTaskDefinition
+                Resource: "*"
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/springboot-hello-world:*
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt TaskExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: springboot-hello-world
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 20
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        ImagePullCredentialsType: CODEBUILD
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPOSITORY_URI
+            Value: !GetAtt ImageRepository.RepositoryUri
+          - Name: IMAGE_TAG
+            Value: !Ref ImageTag
+          - Name: ECS_CLUSTER
+            Value: !Ref Cluster
+          - Name: ECS_CLUSTER_ARN
+            Value: !GetAtt Cluster.Arn
+          - Name: SUBNET_ID
+            Value: !Ref PublicSubnet
+          - Name: SECURITY_GROUP_ID
+            Value: !Ref FargateSecurityGroup
+          - Name: TASK_EXECUTION_ROLE_ARN
+            Value: !GetAtt TaskExecutionRole.Arn
+          - Name: TASK_LOG_GROUP
+            Value: !Ref TaskLogGroup
+          - Name: HELLO_NAME
+            Value: !Ref HelloName
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  mkdir -p src/main/java/example
+                  cat > pom.xml <<'EOF'
+                  <project xmlns="http://maven.apache.org/POM/4.0.0"
+                           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                           xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+                    <modelVersion>4.0.0</modelVersion>
+                    <parent>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-parent</artifactId>
+                      <version>3.3.5</version>
+                      <relativePath/>
+                    </parent>
+                    <groupId>example</groupId>
+                    <artifactId>hello-world</artifactId>
+                    <version>0.0.1-SNAPSHOT</version>
+                    <properties>
+                      <java.version>17</java.version>
+                    </properties>
+                    <dependencies>
+                      <dependency>
+                        <groupId>org.springframework.boot</groupId>
+                        <artifactId>spring-boot-starter</artifactId>
+                      </dependency>
+                    </dependencies>
+                    <build>
+                      <plugins>
+                        <plugin>
+                          <groupId>org.springframework.boot</groupId>
+                          <artifactId>spring-boot-maven-plugin</artifactId>
+                        </plugin>
+                      </plugins>
+                    </build>
+                  </project>
+                  EOF
+                  cat > src/main/java/example/HelloApplication.java <<'EOF'
+                  package example;
+
+                  import org.springframework.boot.CommandLineRunner;
+                  import org.springframework.boot.SpringApplication;
+                  import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+                  @SpringBootApplication
+                  public class HelloApplication implements CommandLineRunner {
+                      public static void main(String[] args) {
+                          SpringApplication.run(HelloApplication.class, args);
+                      }
+
+                      @Override
+                      public void run(String... args) {
+                          String name = System.getenv().getOrDefault("HELLO_NAME", "World");
+                          System.out.println("Hello, " + name + "!");
+                      }
+                  }
+                  EOF
+                  cat > Dockerfile <<'EOF'
+                  FROM eclipse-temurin:17-jre
+                  WORKDIR /app
+                  COPY target/hello-world-0.0.1-SNAPSHOT.jar app.jar
+                  ENTRYPOINT ["java", "-jar", "app.jar"]
+                  EOF
+                  mvn -B package
+                  image="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+                  aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URI"
+                  docker build -t "$image" .
+                  docker push "$image"
+                  container_definitions=$(jq -cn \
+                    --arg image "$image" \
+                    --arg region "$AWS_DEFAULT_REGION" \
+                    --arg log_group "$TASK_LOG_GROUP" \
+                    '[{
+                      name: "hello",
+                      image: $image,
+                      essential: true,
+                      logConfiguration: {
+                        logDriver: "awslogs",
+                        options: {
+                          "awslogs-group": $log_group,
+                          "awslogs-region": $region,
+                          "awslogs-stream-prefix": "hello"
+                        }
+                      }
+                    }]')
+                  task_definition_arn=$(aws ecs register-task-definition \
+                    --family springboot-hello-world \
+                    --network-mode awsvpc \
+                    --requires-compatibilities FARGATE \
+                    --cpu 256 \
+                    --memory 512 \
+                    --execution-role-arn "$TASK_EXECUTION_ROLE_ARN" \
+                    --container-definitions "$container_definitions" \
+                    --query 'taskDefinition.taskDefinitionArn' \
+                    --output text)
+                  overrides=$(jq -cn --arg name "$HELLO_NAME" \
+                    '{containerOverrides:[{name:"hello",environment:[{name:"HELLO_NAME",value:$name}]}]}')
+                  response=$(aws ecs run-task \
+                    --cluster "$ECS_CLUSTER" \
+                    --task-definition "$task_definition_arn" \
+                    --launch-type FARGATE \
+                    --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SECURITY_GROUP_ID],assignPublicIp=ENABLED}" \
+                    --overrides "$overrides")
+                  if printf '%s' "$response" | jq -e '(.failures // []) | length > 0' >/dev/null; then
+                    printf '%s\n' "$response" | jq -r '.failures[] | "Fargate task failed to start: \(.reason) \(.detail // "")"' >&2
+                    exit 1
+                  fi
+                  task_arn=$(printf '%s' "$response" | jq -r '.tasks[0].taskArn // empty')
+                  if [ -z "$task_arn" ]; then
+                    printf 'ECS did not return a task ARN: %s\n' "$response" >&2
+                    exit 1
+                  fi
+                  aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$task_arn"
+                  exit_code=$(aws ecs describe-tasks \
+                    --cluster "$ECS_CLUSTER" \
+                    --tasks "$task_arn" \
+                    --query 'tasks[0].containers[0].exitCode' \
+                    --output text)
+                  if [ "$exit_code" != "0" ]; then
+                    printf 'Fargate task %s exited with code %s; inspect CloudWatch log group %s\n' "$task_arn" "$exit_code" "$TASK_LOG_GROUP" >&2
+                    exit 1
+                  fi
+                  printf 'Fargate task completed successfully: %s\n' "$task_arn"
+
+Outputs:
+  CodeBuildProjectName:
+    Description: CodeBuild project that builds and runs the Fargate task.
+    Value: !Ref CodeBuildProject
+  EcrRepositoryUri:
+    Description: ECR repository receiving the built image.
+    Value: !GetAtt ImageRepository.RepositoryUri
+  EcsClusterName:
+    Description: ECS cluster used for the Fargate task.
+    Value: !Ref Cluster
+  TaskLogGroupName:
+    Description: CloudWatch Logs group containing the Spring Boot greeting.
+    Value: !Ref TaskLogGroup
