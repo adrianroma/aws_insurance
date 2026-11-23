@@ -9,7 +9,11 @@ Parameters:
   S3ObjectKey:
     Type: String
     Default: sample/output.txt
-    Description: S3 object key written by the Fargate task.
+    Description: S3 object key exposed to the Fargate container.
+  ContainerImage:
+    Type: String
+    Default: 918106143936.dkr.ecr.us-east-2.amazonaws.com/insurance/development:latest
+    Description: ECR image to run in the Fargate task.
 
 Resources:
   OutputBucket:
@@ -141,13 +145,8 @@ Resources:
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
         - Name: insurance-worker
-          Image: public.ecr.aws/aws-cli/aws-cli:2
+          Image: !Ref ContainerImage
           Essential: true
-          Command:
-            - s3
-            - cp
-            - /etc/hostname
-            - s3://placeholder/placeholder
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -233,7 +232,6 @@ Resources:
                     '{
                       containerOverrides: [{
                         name: "insurance-worker",
-                        command: ["s3", "cp", "/etc/hostname", ("s3://" + $bucket + "/" + $key)],
                         environment: [
                           {name: "S3_BUCKET", value: $bucket},
                           {name: "S3_OBJECT_KEY", value: $key},

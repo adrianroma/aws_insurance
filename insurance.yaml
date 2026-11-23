@@ -3,3 +3,4 @@ template-file-path: insurance-stack.yaml
 parameters:
   RunId: sample-run
   S3ObjectKey: sample/output.txt
+  ContainerImage: 918106143936.dkr.ecr.us-east-2.amazonaws.com/insurance/development:latest
